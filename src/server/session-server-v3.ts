@@ -399,6 +399,44 @@ const HELD_PROBE_MAX_MS = 2000;
  */
 const INTERRUPTED_BODY = '[command not run: interrupted before its body was all typed in]';
 
+/**
+ * The shell a session runs when none is given: SESSION_SHELL, else bash, or
+ * on Windows WSL's bash.
+ */
+export const defaultShell = (env: NodeJS.ProcessEnv, platform: NodeJS.Platform): string =>
+  env.SESSION_SHELL || (platform === 'win32' ? 'wsl.exe' : '/bin/bash');
+
+/**
+ * Whether a shell runs under WSL: on Windows, a shell whose file name is
+ * wsl or wsl.exe, in any case.
+ */
+export const isWslShell = (shell: string, platform: NodeJS.Platform): boolean =>
+  platform === 'win32' && /(^|[\\/])wsl(\.exe)?$/i.test(shell);
+
+/**
+ * A command's temp file named as its shell reads it. On Windows the file is
+ * on the host filesystem: WSL sees it as /mnt/c/Users/...; Git Bash, MSYS2
+ * and Cygwin read C:/Users/... as is.
+ */
+export const shellPathFor = (file: string, platform: NodeJS.Platform, onWsl: boolean): string =>
+  platform !== 'win32' ? file
+    : onWsl
+      ? file.replace(/^([A-Za-z]):\\/, (_, drive) => `/mnt/${drive.toLowerCase()}/`).replace(/\\/g, '/')
+      : file.replace(/\\/g, '/');
+
+/**
+ * Output without ConPTY's erase-character sequences (ESC[<n>X), with which
+ * it blanks the rest of a line on Windows, WSL included. They carry no text.
+ */
+export const stripEraseChars = (text: string): string => text.replace(/\x1b\[\d*X/g, '');
+
+/**
+ * The signals that ask a shell to end. node-pty on Windows has no signals
+ * (it throws on any signal name), so there these end the shell with kill()
+ * and any other is refused (see killShell).
+ */
+const ENDING_SIGNALS = new Set(['SIGTERM', 'SIGKILL', 'SIGHUP']);
+
 export class PersistentSessionServer extends EventEmitter {
   private sessions: Map<string, SessionInfo> = new Map();
   private readonly maxLogSize = 10000; // lines per session
@@ -455,13 +493,12 @@ export class PersistentSessionServer extends EventEmitter {
 
     // SESSION_SHELL sets the default, e.g. Git Bash's bash.exe on Windows
     // instead of WSL. It has to be a POSIX shell (see writeCommandViaTempFile).
-    const shell = options.shell || process.env.SESSION_SHELL
-      || (process.platform === 'win32' ? 'wsl.exe' : '/bin/bash');
+    const shell = options.shell || defaultShell(process.env, process.platform);
     const cwd = options.cwd || process.cwd();
     const env = { ...process.env, ...options.env };
 
     // For WSL, we need to tell it to run bash in Ubuntu specifically
-    const onWsl = process.platform === 'win32' && /(^|[\\/])wsl(\.exe)?$/i.test(shell);
+    const onWsl = isWslShell(shell, process.platform);
     const shellArgs = onWsl ? ['-d', 'Ubuntu', 'bash'] : [];
 
     // Create PTY instance
@@ -1154,9 +1191,7 @@ export class PersistentSessionServer extends EventEmitter {
         output = output.slice(0, exitAt);
       }
     }
-    // ConPTY (Windows, WSL included) blanks the rest of a line with erase-
-    // character sequences (ESC[<n>X), which carry no text.
-    if (process.platform === 'win32') output = output.replace(/\x1b\[\d*X/g, '');
+    if (process.platform === 'win32') output = stripEraseChars(output);
     const cleanOutput = how.reason ?? this.stripPlumbingSpans(session, output).trim();
 
     const duration = Date.now() - currentCommand.startTime;
@@ -1677,12 +1712,7 @@ export class PersistentSessionServer extends EventEmitter {
       throw err;
     }
     session.pendingFiles.set(nonce, file);
-    // On Windows the temp file lives on the host filesystem. WSL sees it as
-    // /mnt/c/Users/...; Git Bash, MSYS2 and Cygwin read C:/Users/... as is.
-    const shellPath = process.platform !== 'win32' ? file
-      : session.onWsl
-        ? file.replace(/^([A-Za-z]):\\/, (_, drive) => `/mnt/${drive.toLowerCase()}/`).replace(/\\/g, '/')
-        : file.replace(/\\/g, '/');
+    const shellPath = shellPathFor(file, process.platform, session.onWsl);
     this.rememberIssued(session, nonce, shellPath);
     // Single-quote the path to be safe against unusual tmpdir characters. The
     // line runs it with `.` (POSIX source), which keeps execution in the
@@ -1815,15 +1845,6 @@ export class PersistentSessionServer extends EventEmitter {
    * in front is at its prompt reading a body's line, when nothing is written
    * (see withholdsLoneCtrlC).
    */
-  /**
-   * Send a signal to the session's shell. node-pty on Windows has no signals
-   * (it throws on any signal name), so there every signal ends the shell.
-   */
-  private killShell(session: SessionInfo, signal: string): void {
-    if (process.platform === 'win32') session.shell.kill();
-    else session.shell.kill(signal);
-  }
-
   sendSignal(sessionId: string, signal: string = 'SIGINT'): void {
     const session = this.sessions.get(sessionId);
     if (!session || !session.isAlive) {
@@ -1846,6 +1867,24 @@ export class PersistentSessionServer extends EventEmitter {
       signal,
       timestamp: new Date()
     });
+  }
+
+  /**
+   * Send a signal to the session's shell. On Windows, where node-pty has no
+   * signals, one that asks the shell to end (ENDING_SIGNALS) ends it with
+   * kill(), and any other is refused, leaving the session running.
+   */
+  private killShell(session: SessionInfo, signal: string): void {
+    if (process.platform !== 'win32') {
+      session.shell.kill(signal);
+    } else if (ENDING_SIGNALS.has(signal)) {
+      session.shell.kill();
+    } else {
+      throw new Error(
+        `Signal ${signal} can't be sent on Windows, which has no signals: only SIGINT (sent as Ctrl+C) ` +
+        `and SIGTERM, SIGKILL or SIGHUP, which end the session's shell. Nothing was sent.`
+      );
+    }
   }
 
   /**
@@ -2026,7 +2065,9 @@ export class PersistentSessionServer extends EventEmitter {
         // again every 500 ms while the shell is still there. In our runs on
         // Linux (bash 5.2), a SIGHUP sent right after a command left the shell
         // running 1.5 s later in 39 of 120 trials, and a second SIGHUP, or an
-        // Enter, ended it within about 30 ms each time.
+        // Enter, ended it within about 30 ms each time. Windows has no SIGHUP
+        // (see killShell): there this first call ends the shell outright, its
+        // jobs aren't hung up, and a graceful kill is the same as a forced one.
         this.killShell(session, 'SIGHUP');
 
         // Wait up to 3 seconds for the process to exit gracefully
