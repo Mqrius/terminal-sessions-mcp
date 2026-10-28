@@ -1154,6 +1154,9 @@ export class PersistentSessionServer extends EventEmitter {
         output = output.slice(0, exitAt);
       }
     }
+    // ConPTY (Windows, WSL included) blanks the rest of a line with erase-
+    // character sequences (ESC[<n>X), which carry no text.
+    if (process.platform === 'win32') output = output.replace(/\x1b\[\d*X/g, '');
     const cleanOutput = how.reason ?? this.stripPlumbingSpans(session, output).trim();
 
     const duration = Date.now() - currentCommand.startTime;
