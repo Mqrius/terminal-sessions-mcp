@@ -1812,6 +1812,15 @@ export class PersistentSessionServer extends EventEmitter {
    * in front is at its prompt reading a body's line, when nothing is written
    * (see withholdsLoneCtrlC).
    */
+  /**
+   * Send a signal to the session's shell. node-pty on Windows has no signals
+   * (it throws on any signal name), so there every signal ends the shell.
+   */
+  private killShell(session: SessionInfo, signal: string): void {
+    if (process.platform === 'win32') session.shell.kill();
+    else session.shell.kill(signal);
+  }
+
   sendSignal(sessionId: string, signal: string = 'SIGINT'): void {
     const session = this.sessions.get(sessionId);
     if (!session || !session.isAlive) {
@@ -1825,10 +1834,8 @@ export class PersistentSessionServer extends EventEmitter {
       const { reason, partway } = this.interruptTyping(session);
       if (!this.withholdsLoneCtrlC(session, partway)) session.shell.write('\x03');
       if (reason !== undefined) this.resolveCommand(session, -1, { reason });
-    } else if (signal === 'SIGTERM') {
-      session.shell.kill('SIGTERM');
     } else {
-      session.shell.kill(signal as any);
+      this.killShell(session, signal);
     }
 
     this.notify('session:signal', {
@@ -2017,7 +2024,7 @@ export class PersistentSessionServer extends EventEmitter {
         // Linux (bash 5.2), a SIGHUP sent right after a command left the shell
         // running 1.5 s later in 39 of 120 trials, and a second SIGHUP, or an
         // Enter, ended it within about 30 ms each time.
-        session.shell.kill('SIGHUP');
+        this.killShell(session, 'SIGHUP');
 
         // Wait up to 3 seconds for the process to exit gracefully
         const timeout = 3000;
@@ -2027,7 +2034,7 @@ export class PersistentSessionServer extends EventEmitter {
         while (session.isAlive && Date.now() - startTime < timeout) {
           await this.sleep(50);
           if (session.isAlive && Date.now() >= nextHangup) {
-            session.shell.kill('SIGHUP');
+            this.killShell(session, 'SIGHUP');
             nextHangup += 500;
           }
         }
@@ -2035,11 +2042,11 @@ export class PersistentSessionServer extends EventEmitter {
         // If still alive after timeout, force kill
         if (session.isAlive) {
           this.addLog(session, '[Process did not exit gracefully, forcing termination]');
-          session.shell.kill('SIGKILL');
+          this.killShell(session, 'SIGKILL');
         }
       } else {
         // Force kill immediately
-        session.shell.kill('SIGKILL');
+        this.killShell(session, 'SIGKILL');
       }
     }
 

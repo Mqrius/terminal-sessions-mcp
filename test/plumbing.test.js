@@ -1943,7 +1943,9 @@ test("sendSignal sends a signal other than SIGINT to the shell itself, and write
     assert.ok(session.inlinePieces.has('n1') && session.shellAtPrompt, 'a body the shell is partway through reading, as for the SIGINT tests');
     const before = written.length;
     for (const signal of ['SIGTERM', 'SIGKILL', 'SIGHUP']) server.sendSignal('s', signal);
-    assert.deepEqual(killed, ['SIGTERM', 'SIGKILL', 'SIGHUP'], 'each goes to the shell');
+    // node-pty on Windows throws on any signal name: there each one ends the shell.
+    const sent = process.platform === 'win32' ? [undefined, undefined, undefined] : ['SIGTERM', 'SIGKILL', 'SIGHUP'];
+    assert.deepEqual(killed, sent, 'each goes to the shell');
     assert.deepEqual(written.slice(before), [], 'nothing is written');
   } finally {
     for (const file of session.pendingFiles.values()) fs.rmSync(file, { force: true });
