@@ -22,6 +22,9 @@ interface SessionInfo {
   id: string;
   name: string;
   shell: IPty;
+  // Whether the shell runs under WSL, which sees this machine's drives as
+  // /mnt/<drive>/ rather than as Windows paths.
+  onWsl: boolean;
   logs: string[];
   cwd: string;
   env: Record<string, string>;
@@ -450,12 +453,16 @@ export class PersistentSessionServer extends EventEmitter {
       throw new Error(`Session ${id} already exists`);
     }
 
-    const shell = options.shell || (process.platform === 'win32' ? 'wsl.exe' : '/bin/bash');
+    // SESSION_SHELL sets the default, e.g. Git Bash's bash.exe on Windows
+    // instead of WSL. It has to be a POSIX shell (see writeCommandViaTempFile).
+    const shell = options.shell || process.env.SESSION_SHELL
+      || (process.platform === 'win32' ? 'wsl.exe' : '/bin/bash');
     const cwd = options.cwd || process.cwd();
     const env = { ...process.env, ...options.env };
 
     // For WSL, we need to tell it to run bash in Ubuntu specifically
-    const shellArgs = shell === 'wsl.exe' ? ['-d', 'Ubuntu', 'bash'] : [];
+    const onWsl = process.platform === 'win32' && /(^|[\\/])wsl(\.exe)?$/i.test(shell);
+    const shellArgs = onWsl ? ['-d', 'Ubuntu', 'bash'] : [];
 
     // Create PTY instance
     const ptyProcess = pty.spawn(shell, shellArgs, {
@@ -470,6 +477,7 @@ export class PersistentSessionServer extends EventEmitter {
       id,
       name: id,
       shell: ptyProcess,
+      onWsl,
       logs: [],
       cwd,
       env: options.env || {},
@@ -1666,12 +1674,12 @@ export class PersistentSessionServer extends EventEmitter {
       throw err;
     }
     session.pendingFiles.set(nonce, file);
-    // On Windows the shell is WSL but the temp file lives on the host
-    // filesystem — translate C:\Users\... to /mnt/c/Users/... so the shell
-    // can actually source it.
-    const shellPath = process.platform === 'win32'
-      ? file.replace(/^([A-Za-z]):\\/, (_, drive) => `/mnt/${drive.toLowerCase()}/`).replace(/\\/g, '/')
-      : file;
+    // On Windows the temp file lives on the host filesystem. WSL sees it as
+    // /mnt/c/Users/...; Git Bash, MSYS2 and Cygwin read C:/Users/... as is.
+    const shellPath = process.platform !== 'win32' ? file
+      : session.onWsl
+        ? file.replace(/^([A-Za-z]):\\/, (_, drive) => `/mnt/${drive.toLowerCase()}/`).replace(/\\/g, '/')
+        : file.replace(/\\/g, '/');
     this.rememberIssued(session, nonce, shellPath);
     // Single-quote the path to be safe against unusual tmpdir characters. The
     // line runs it with `.` (POSIX source), which keeps execution in the

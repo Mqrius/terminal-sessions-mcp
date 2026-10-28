@@ -65,6 +65,18 @@ test("a command's file is created exclusively: never through a link, never into 
   }
 });
 
+test("on Windows a command's file is named as its shell reads it: /mnt/<drive>/ under WSL, C:/ in Git Bash", { skip: process.platform === 'win32' ? false : 'paths are translated only on Windows' }, () => {
+  const server = bareServer();
+  for (const [onWsl, form] of [[true, /^'\/mnt\/[a-z]\/[^\\]+'$/], [false, /^'[A-Za-z]:\/[^\\]+'$/]]) {
+    const session = { ...bareSession(), onWsl };
+    try {
+      assert.match(server.writeCommandViaTempFile(session, `path${onWsl}${process.pid}`, 'echo hi'), form);
+    } finally {
+      for (const file of session.pendingFiles.values()) fs.rmSync(file, { force: true });
+    }
+  }
+});
+
 /** The line the server types for a command (writeCommandViaTempFile makes the `. '<file>'` part). */
 const typedLine = (nonce, file) => bareServer().wrapperLine(nonce, `. '${file}'`);
 // A body as printfBody escapes it: `cat <<'E'`, a line with a tab, a
